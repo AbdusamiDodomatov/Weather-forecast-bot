@@ -3,6 +3,10 @@ import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+import psycopg2
+
+load_dotenv()
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API = os.getenv("WEATHER_API")
@@ -14,6 +18,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 @bot.message_handler(commands=['start'])
 def start(message):
+    save_user(message.from_user)
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     location_button = types.KeyboardButton('📍 Send Location', request_location=True)
     city_button = types.KeyboardButton('🏙 Choose City')
@@ -38,6 +43,43 @@ def handle_location(message):
             recommend_nearby_cities(message.chat.id, lat, lon)
         else:
             bot.send_message(message.chat.id, "⚠️ I couldn't determine your city. Try again later.")
+
+
+@bot.message_handler(commands=["users_count"])
+def users_count(message):
+    try:
+        admin_id = int(os.getenv("ADMIN_ID", 0)) 
+
+        if message.chat.id == admin_id:  
+            count = get_total_users()  
+            bot.send_message(message.chat.id, f"👥 Всего пользователей: {count}")
+        else:
+            bot.send_message(message.chat.id, "🚫 У вас нет доступа к этой информации.")
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ Ошибка при получении количества пользователей.")
+        print(f"Error in users_count: {e}")
+
+
+def get_total_users():
+    conn = psycopg2.connect(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT")
+    )
+    cur = conn.cursor()
+    
+    cur.execute("SELECT COUNT(*) FROM telegram_users;")
+    count = cur.fetchone()[0]
+    
+    cur.close()
+    conn.close()
+    
+    return count
+
+
+
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -124,5 +166,50 @@ def get_city_by_location(lat, lon):
     except Exception as e:
         print(f"Error: {e}")
         return None
+    
+def save_user(user, phone_number=None):
+    try:
+        conn = psycopg2.connect(
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT"),
+        )
+        cur = conn.cursor()
+
+        user_data = {
+            "telegram_id": user.id,
+            "username": user.username if hasattr(user, "username") else None,
+            "first_name": user.first_name if hasattr(user, "first_name") else None,
+            "last_name": user.last_name if hasattr(user, "last_name") else None,
+            "language_code": user.language_code if hasattr(user, "language_code") else None,
+            "is_premium": getattr(user, "is_premium", False),
+            "phone_number": phone_number,
+        }
+
+        query = """
+            INSERT INTO telegram_users 
+            (telegram_id, username, first_name, last_name, language_code, is_premium, phone_number) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (telegram_id) DO UPDATE 
+            SET username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                language_code = EXCLUDED.language_code,
+                is_premium = EXCLUDED.is_premium,
+                phone_number = EXCLUDED.phone_number;
+        """
+
+        cur.execute(query, tuple(user_data.values()))
+
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"Ошибка при сохранении пользователя: {e}")
+
 
 bot.infinity_polling(none_stop=True)
