@@ -3,213 +3,244 @@ import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
-import psycopg2
+import psycopg2.pool
+import logging
+from datetime import datetime, timedelta, timezone
+import gettext
+from apscheduler.schedulers.background import BackgroundScheduler
 
+# Загрузка переменных окружения
 load_dotenv()
 
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API = os.getenv("WEATHER_API")
+API_KEY = os.getenv("WEATHER_API")
 
-if not BOT_TOKEN or not API:
+if not BOT_TOKEN or not API_KEY:
     raise ValueError("Missing BOT_TOKEN or WEATHER_API in .env file.")
 
+# Подключение к боту
 bot = telebot.TeleBot(BOT_TOKEN)
+user_selected_city = {}
+
+# Настройка пула соединений с базой данных
+DB_PARAMS = {
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
+}
+conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
+
+# Настройка мультиязычности
+gettext.bindtextdomain("messages", "locale")
+gettext.textdomain("messages")
+_ = gettext.gettext  # Функция перевода
+
+
+def execute_query(query, params=None, fetchone=False, fetchall=False):
+    """ Выполнение SQL-запросов с использованием пула соединений """
+    conn = conn_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            conn.commit()
+            if fetchone:
+                return cur.fetchone()
+            elif fetchall:
+                return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Ошибка в БД: {e}")
+    finally:
+        conn_pool.putconn(conn)
+
+
+def save_user(user):
+    """ Сохранение пользователя в базу данных """
+    query = """
+        INSERT INTO telegram_users (telegram_id, username, first_name, last_name, language_code, is_premium)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE 
+        SET username = EXCLUDED.username, 
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            language_code = EXCLUDED.language_code,
+            is_premium = EXCLUDED.is_premium;
+    """
+    params = (user.id, user.username, user.first_name, user.last_name, user.language_code, getattr(user, "is_premium", False))
+    execute_query(query, params)
+
 
 @bot.message_handler(commands=['start'])
 def start(message):
     save_user(message.from_user)
+    
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    location_button = types.KeyboardButton('📍 Send Location', request_location=True)
-    city_button = types.KeyboardButton('🏙 Choose City')
+    location_button = types.KeyboardButton(_('📍 Отправить локацию'), request_location=True)
+    city_button = types.KeyboardButton(_('🏙 Выбрать город'))
+    
     markup.add(location_button, city_button)
 
-    welcome_text = (
-        "👋 Hi! I'm your weather bot!\n\n"
-        "🌍 Send your **location** or choose a **city** to get the weather forecast."
+    bot.send_message(
+        message.chat.id,
+        _("👋 Привет! Я твой погодный бот!\n\n🌍 Отправь свою **локацию** или выбери **город**, чтобы узнать прогноз погоды."),
+        reply_markup=markup, parse_mode="Markdown"
     )
 
-    bot.send_message(message.chat.id, welcome_text, reply_markup=markup, parse_mode="Markdown")
+
+def make_weather_request(endpoint, params):
+    """ Универсальный метод для запросов к OpenWeatherMap """
+    try:
+        url = f"https://api.openweathermap.org/data/2.5/{endpoint}"
+        params["appid"] = API_KEY
+        params["units"] = "metric"
+        response = requests.get(url, params=params)
+        return response.json()
+    except Exception as e:
+        logging.error(f"Ошибка запроса к OpenWeatherMap: {e}")
+        return None
+
+
+def fetch_weather(chat_id, city):
+    data = make_weather_request("weather", {"q": city})
+
+    if not data or data.get("cod") != 200:
+        bot.send_message(chat_id, f"⚠️ Город **{city}** не найден или API недоступен.")
+        return
+
+    try:
+        temp = round(data["main"]["temp"])
+        description = data["weather"][0]["description"].capitalize()
+        icon_code = data["weather"][0]["icon"]
+        icon_url = f"http://openweathermap.org/img/wn/{icon_code}@4x.png"
+
+        response = (
+            f"🌤 **Погода в {city}**\n"
+            f"🌡 Температура: *{temp}°C*\n"
+            f"📖 Описание: *{description}*"
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📅 Погода на завтра", callback_data=f"forecast_{city}"))
+        markup.add(types.InlineKeyboardButton("🔔 Получать уведомления", callback_data=f"notify_{city}"))
+
+        bot.send_photo(chat_id, icon_url, caption=response, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        logging.error(f"Ошибка обработки данных погоды: {e}")
+        bot.send_message(chat_id, "❌ Произошла ошибка при обработке данных о погоде.")
+
 
 @bot.message_handler(content_types=['location'])
 def handle_location(message):
     if message.location:
         lat, lon = message.location.latitude, message.location.longitude
-        city = get_city_by_location(lat, lon)
+        data = make_weather_request("weather", {"lat": lat, "lon": lon})
 
-        if city:
-            bot.send_message(message.chat.id, f"📍 You're near **{city}**. Fetching weather…", parse_mode="Markdown")
+        if data and data.get("cod") == 200:
+            city = data.get("name")
+            bot.send_message(message.chat.id, _("📍 Вы находитесь в **{}**. Получаем погоду…").format(city), parse_mode="Markdown")
             fetch_weather(message.chat.id, city)
-            recommend_nearby_cities(message.chat.id, lat, lon)
         else:
-            bot.send_message(message.chat.id, "⚠️ I couldn't determine your city. Try again later.")
+            bot.send_message(message.chat.id, _("⚠️ Не удалось определить ваш город. Попробуйте снова."))
 
 
 @bot.message_handler(commands=["users_count"])
 def users_count(message):
-    try:
-        admin_id = int(os.getenv("ADMIN_ID", 0)) 
+    admin_id = int(os.getenv("ADMIN_ID", 0))
 
-        if message.chat.id == admin_id:  
-            count = get_total_users()  
-            bot.send_message(message.chat.id, f"👥 Всего пользователей: {count}")
-        else:
-            bot.send_message(message.chat.id, "🚫 У вас нет доступа к этой информации.")
-    except Exception as e:
-        bot.send_message(message.chat.id, "❌ Ошибка при получении количества пользователей.")
-        print(f"Error in users_count: {e}")
-
-
-def get_total_users():
-    conn = psycopg2.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT")
-    )
-    cur = conn.cursor()
-    
-    cur.execute("SELECT COUNT(*) FROM telegram_users;")
-    count = cur.fetchone()[0]
-    
-    cur.close()
-    conn.close()
-    
-    return count
-
-
-
-
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    if message.text == "🏙 Choose City":
-        recommend_cities(message.chat.id)
+    if message.chat.id == admin_id:
+        count = execute_query("SELECT COUNT(*) FROM telegram_users;", fetchone=True)[0]
+        bot.send_message(message.chat.id, _("👥 Всего пользователей: {}").format(count))
     else:
-        city = message.text.strip().title()  
-        fetch_weather(message.chat.id, city)
+        bot.send_message(message.chat.id, _("🚫 У вас нет доступа к этой информации."))
 
-def recommend_cities(chat_id):
-    popular_cities = ['Tashkent', 'Moscow', 'New York', 'London', 'Tokyo', 'Berlin', 'Paris', 'Dubai']
-    markup = types.InlineKeyboardMarkup(row_width=2)
 
-    for city in popular_cities:
-        markup.add(types.InlineKeyboardButton(city, callback_data=city))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("notify_"))
+def subscribe_notifications(call):
+    city = call.data.replace("notify_", "")
+    user_id = call.message.chat.id
+
+    execute_query(
+        "INSERT INTO weather_subscriptions (user_id, city) VALUES (%s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET city = EXCLUDED.city;",
+        (user_id, city)
+    )
+    bot.send_message(user_id, f"✅ Теперь вы будете получать ежедневные уведомления о погоде в **{city}**!")
+
+
+@bot.message_handler(commands=['unsubscribe'])
+def unsubscribe_notifications(message):
+    execute_query("DELETE FROM weather_subscriptions WHERE user_id = %s;", (message.chat.id,))
+    bot.send_message(message.chat.id, "🚫 Вы отписались от уведомлений о погоде.")
+
+
+def send_weather_notifications():
+    subscriptions = execute_query("SELECT user_id, city FROM weather_subscriptions;", fetchall=True)
+    for user_id, city in subscriptions:
+        fetch_weather(user_id, city)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("forecast_"))
+
+def forecast_weather(call):
+    city = call.data.replace("forecast_", "")
+    user_id = call.message.chat.id
+
+    # Запрашиваем прогноз погоды на 1 день вперёд
+    data = make_weather_request("forecast", {"q": city, "cnt": 8})  # 8 временных отметок (24 часа)
+
+    if not data or data.get("cod") != "200":
+        bot.send_message(user_id, f"⚠️ Не удалось получить прогноз погоды для **{city}**.")
+        return
+
+        # Получаем данные о погоде на следующий день
+    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+    next_day_data = [entry for entry in data["list"] if datetime.fromtimestamp(entry["dt"], timezone.utc).date() == tomorrow.date()]
+
+
+
+    if not next_day_data:
+        bot.send_message(user_id, f"⚠️ Прогноз на завтра для **{city}** не найден.")
+        return
+
+    # Рассчитываем среднюю температуру и общее описание погоды
+    avg_temp = sum(entry["main"]["temp"] for entry in next_day_data) / len(next_day_data)
+    descriptions = {entry["weather"][0]["description"] for entry in next_day_data}
+    weather_description = ", ".join(descriptions).capitalize()
+
+    # Берём иконку погоды из первой записи
+    icon_code = next_day_data[0]["weather"][0]["icon"]
+    icon_url = f"http://openweathermap.org/img/wn/{icon_code}@4x.png"
+
+    response = (
+        f"📅 **Прогноз погоды на завтра в {city}**\n"
+        f"🌡 Средняя температура: *{round(avg_temp)}°C*\n"
+        f"📖 Описание: *{weather_description}*"
+    )
+
+    bot.send_photo(user_id, icon_url, caption=response, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda message: message.text == _('🏙 Выбрать город'))
+def ask_city(message):
+    bot.send_message(message.chat.id, "Введите название города, для которого хотите узнать погоду:")
+    bot.register_next_step_handler(message, handle_city_input)
+
+
+def handle_city_input(message):
+    city = message.text.strip()
+    if not city:
+        bot.send_message(message.chat.id, "⚠️ Пожалуйста, введите корректное название города.")
+        return
     
-    bot.send_message(chat_id, "🌎 Choose a city:", reply_markup=markup)
-
-def recommend_nearby_cities(chat_id, lat, lon):
-    try:
-        url = f'https://api.openweathermap.org/data/2.5/find?lat={lat}&lon={lon}&cnt=5&appid={API}&units=metric'
-        res = requests.get(url)
-        data = res.json()
-
-        if not data.get("list"):
-            bot.send_message(chat_id, "⚠️ Couldn't find nearby cities.")
-            return
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        for city_data in data["list"][:3]: 
-            city_name = city_data["name"]
-            markup.add(types.InlineKeyboardButton(city_name, callback_data=city_name))
-        
-        bot.send_message(chat_id, "🌍 Nearby cities:", reply_markup=markup)
-    except Exception as e:
-        bot.send_message(chat_id, "❌ Error fetching nearby cities.")
-        print(f"Error: {e}")
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    try:
-        fetch_weather(call.message.chat.id, call.data)
-    except Exception as e:
-        bot.send_message(call.message.chat.id, "❌ An error occurred while processing your request.")
-        print(f"Error: {e}")
-
-def fetch_weather(chat_id, city):
-    try:
-        url = f'https://api.openweathermap.org/data/2.5/weather?q={city}&appid={API}&units=metric'
-        res = requests.get(url)
-        data = res.json()
-
-        if data.get("cod") != 200:
-            bot.send_message(chat_id, f"⚠️ Sorry, I couldn't find weather data for **{city}**.")
-            return
-
-        weather_condition = data["weather"][0]["main"]
-        temp = round(data["main"]["temp"])
-        description = data["weather"][0]["description"].capitalize()
-        icon_code = data["weather"][0]["icon"]
-        icon_url = f"https://openweathermap.org/img/wn/{icon_code}@4x.png"
-
-        response = (
-            f"🌤 **Weather in {city}**\n"
-            f"📌 Condition: *{weather_condition}*\n"
-            f"🌡 Temperature: *{temp}°C*\n"
-            f"📖 Description: *{description}*"
-        )
-
-        bot.send_photo(chat_id, icon_url, caption=response, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(chat_id, "❌ An error occurred while fetching the weather. Try again later.")
-        print(f"Error: {e}")
-
-def get_city_by_location(lat, lon):
-    try:
-        url = f'http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API}'
-        res = requests.get(url)
-        data = res.json()
-
-        if data.get("cod") == 200:
-            return data.get("name")
-        return None
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
-    
-def save_user(user, phone_number=None):
-    try:
-        conn = psycopg2.connect(
-            dbname=os.getenv("DB_NAME"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            host=os.getenv("DB_HOST"),
-            port=os.getenv("DB_PORT"),
-        )
-        cur = conn.cursor()
-
-        user_data = {
-            "telegram_id": user.id,
-            "username": user.username if hasattr(user, "username") else None,
-            "first_name": user.first_name if hasattr(user, "first_name") else None,
-            "last_name": user.last_name if hasattr(user, "last_name") else None,
-            "language_code": user.language_code if hasattr(user, "language_code") else None,
-            "is_premium": getattr(user, "is_premium", False),
-            "phone_number": phone_number,
-        }
-
-        query = """
-            INSERT INTO telegram_users 
-            (telegram_id, username, first_name, last_name, language_code, is_premium, phone_number) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (telegram_id) DO UPDATE 
-            SET username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                language_code = EXCLUDED.language_code,
-                is_premium = EXCLUDED.is_premium,
-                phone_number = EXCLUDED.phone_number;
-        """
-
-        cur.execute(query, tuple(user_data.values()))
-
-        conn.commit()
-
-        cur.close()
-        conn.close()
-
-    except Exception as e:
-        print(f"Ошибка при сохранении пользователя: {e}")
+    fetch_weather(message.chat.id, city)
 
 
+scheduler = BackgroundScheduler()
+scheduler.add_job(send_weather_notifications, "interval", hours=24, next_run_time=datetime.now() + timedelta(seconds=10))
+scheduler.start()
+
+# Запуск бота
 bot.infinity_polling(none_stop=True)
