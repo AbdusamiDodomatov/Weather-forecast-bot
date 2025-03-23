@@ -6,3 +6,5 @@ python-dotenv==1.0.1
 requests==2.32.3
 telebot==0.0.5
 urllib3==2.3.0
+psycopg2-binary
+apscheduler
