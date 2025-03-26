@@ -10,8 +10,7 @@ import gettext
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # Загрузка переменных окружения
-load_dotenv()
-
+#load_dotenv()
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -90,7 +89,6 @@ def start(message):
         _("👋 Привет! Я твой погодный бот!\n\n🌍 Отправь свою **локацию** или выбери **город**, чтобы узнать прогноз погоды."),
         reply_markup=markup, parse_mode="Markdown"
     )
-
 
 def make_weather_request(endpoint, params):
     """ Универсальный метод для запросов к OpenWeatherMap """
