@@ -4,6 +4,7 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 import psycopg2.pool
+from urllib.parse import urlparse
 import logging
 from datetime import datetime, timedelta, timezone
 import gettext
@@ -18,6 +19,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("WEATHER_API")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+parsed_url = urlparse(DATABASE_URL)
+
 if not BOT_TOKEN or not API_KEY:
     raise ValueError("Missing BOT_TOKEN or WEATHER_API in .env file.")
 
@@ -27,14 +31,14 @@ user_selected_city = {}
 
 # Настройка пула соединений с базой данных
 DB_PARAMS = {
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT"),
+    "dbname": parsed_url.path[1:], 
+    "user": parsed_url.username,
+    "password": parsed_url.password,
+    "host": parsed_url.hostname,
+    "port": parsed_url.port,
+    "sslmode": "require",
 }
 conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
-
 # Настройка мультиязычности
 gettext.bindtextdomain("messages", "locale")
 gettext.textdomain("messages")
