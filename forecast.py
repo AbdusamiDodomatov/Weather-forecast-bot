@@ -21,9 +21,13 @@ API_KEY = os.getenv("WEATHER_API")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 parsed_url = urlparse(DATABASE_URL)
+NOTIFY_TIME="08:00"
 
 if not BOT_TOKEN or not API_KEY:
     raise ValueError("Missing BOT_TOKEN or WEATHER_API in .env file.")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in environment variables.")
 
 # Подключение к боту
 bot = telebot.TeleBot(BOT_TOKEN)
