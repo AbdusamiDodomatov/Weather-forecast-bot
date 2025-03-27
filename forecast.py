@@ -11,27 +11,24 @@ import gettext
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # Загрузка переменных окружения
-#load_dotenv()
+load_dotenv()
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("WEATHER_API")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
-parsed_url = urlparse(DATABASE_URL)
-NOTIFY_TIME="08:00"
 
 if not BOT_TOKEN or not API_KEY:
-    raise ValueError("Missing BOT_TOKEN or WEATHER_API in .env file.")
+    raise ValueError("Missing BOT_TOKEN or WEATHER_API in environment variables.")
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in environment variables.")
 
-# Подключение к боту
-bot = telebot.TeleBot(BOT_TOKEN)
-user_selected_city = {}
+# Парсим DATABASE_URL
+parsed_url = urlparse(DATABASE_URL)
 
 # Настройка пула соединений с базой данных
 DB_PARAMS = {
@@ -40,9 +37,22 @@ DB_PARAMS = {
     "password": parsed_url.password,
     "host": parsed_url.hostname,
     "port": parsed_url.port,
-    "sslmode": "require",
 }
-conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
+
+# Попробуем подключиться, сначала без SSL
+try:
+    conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
+    logging.info("Connected to PostgreSQL without SSL.")
+except psycopg2.OperationalError as e:
+    logging.warning("Connection failed without SSL, retrying with sslmode='require'...")
+    DB_PARAMS["sslmode"] = "require"
+    conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
+    logging.info("Connected to PostgreSQL with sslmode='require'.")
+
+# Подключение к боту
+bot = telebot.TeleBot(BOT_TOKEN)
+user_selected_city = {}
+
 # Настройка мультиязычности
 gettext.bindtextdomain("messages", "locale")
 gettext.textdomain("messages")
@@ -115,7 +125,7 @@ def fetch_weather(chat_id, city):
     data = make_weather_request("weather", {"q": city})
 
     if not data or data.get("cod") != 200:
-        bot.send_message(chat_id, f"⚠️ Город **{city}** не найден или API недоступен.")
+        bot.send_message(chat_id, f"⚠️ Город **{city}** не найден.")
         return
 
     try:
