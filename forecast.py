@@ -37,17 +37,17 @@ DB_PARAMS = {
     "password": parsed_url.password,
     "host": parsed_url.hostname,
     "port": parsed_url.port,
+    "sslmode": "require",  # Railway требует SSL
 }
 
 # Попробуем подключиться, сначала без SSL
 try:
     conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
-    logging.info("Connected to PostgreSQL without SSL.")
+    logging.info("Connected to PostgreSQL on Railway.")
 except psycopg2.OperationalError as e:
-    logging.warning("Connection failed without SSL, retrying with sslmode='require'...")
-    DB_PARAMS["sslmode"] = "require"
-    conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, **DB_PARAMS)
-    logging.info("Connected to PostgreSQL with sslmode='require'.")
+    logging.error(f"Database connection failed: {e}")
+    raise
+
 
 # Подключение к боту
 bot = telebot.TeleBot(BOT_TOKEN)
